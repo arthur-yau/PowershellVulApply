@@ -1,40 +1,48 @@
 <#
 .SYNOPSIS
-    Apply registry from XML – ONE manifest.json for all runs.
-    Backup .reg files per-run, rollback any previous run.
+    Apply registry from XML – ONE manifest.xml for all runs.
+    Appends every change, supports rollback by RunId.
 
-.PARAMETER XmlPath   Path to the XML file
-.PARAMETER IDs       Comma-separated IDs or "all"
-.PARAMETER Rollback  Restore the *last* apply (or specify RunId)
-.PARAMETER VerifyOnly Verify selected IDs only
+.PARAMETER XmlPath     Path to the settings XML
+.PARAMETER IDs         Comma-separated IDs or "all"
+.PARAMETER Rollback    Restore last run (or use -RunId)
+.PARAMETER RunId       Specific run to rollback
+.PARAMETER VerifyOnly  Verify only
 #>
 
 param(
     [Parameter(Mandatory)][string]$XmlPath,
     [string]$IDs = "all",
     [switch]$Rollback,
-    [string]$RunId,               # optional – rollback a specific run
+    [string]$RunId,
     [switch]$VerifyOnly
 )
 
 # -------------------------------------------------------------------------
-# 0. Configuration
+# 0. Paths & Admin Check
 # -------------------------------------------------------------------------
 $BaseDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ManifestPath = Join-Path $BaseDir "manifest.json"
+$ManifestPath = Join-Path $BaseDir "manifest.xml"
 $BackupRoot   = Join-Path $BaseDir "Backups"
 
-# Ensure folders exist
-foreach ($p in @($BaseDir,$BackupRoot)) { if(-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
+# Ensure folders
+foreach ($p in @($BaseDir, $BackupRoot)) { if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
+
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsPrincipal]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run as Administrator"
+}
 
 # -------------------------------------------------------------------------
 # 1. Helper Functions
 # -------------------------------------------------------------------------
+$TypeMap = @{"String"="String"; "ExpandString"="ExpandString"; "DWord"="DWORD"; "QWord"="QWORD"; "Binary"="Binary"; "MultiString"="MultiString"}
+
 function Convert-Hive { param([string]$p)
     $m = @{"HKLM:"="HKEY_LOCAL_MACHINE"; "HKCU:"="HKEY_CURRENT_USER"; "HKCR:"="HKEY_CLASSES_ROOT"; "HKU:"="HKEY_USERS"; "HKCC:"="HKEY_CURRENT_CONFIG"}
     foreach ($k in $m.Keys) { if ($p -like "$k*") { return $p -replace "^$([regex]::Escape($k))", $m[$k] } }
     $p
 }
+
 function Get-RegValue { param($Path,$Name)
     try {
         $i = Get-Item $Path -EA SilentlyContinue
@@ -43,9 +51,10 @@ function Get-RegValue { param($Path,$Name)
             $t = if ($Name -eq "(Default)") { "String" } else { $i.GetValueKind($Name) }
             return @{Value=$v; Type=$t}
         }
-    }catch{}
+    } catch {}
     return @{Value=$null; Type=$null}
 }
+
 function New-RegBackup { param($Path,$Name,$Value,$Type,$ID,$RunFolder)
     $hive = Convert-Hive $Path
     $safe = if ($Name -eq "(Default)") { "@" } else { "`"$Name`"" }
@@ -68,31 +77,45 @@ function New-RegBackup { param($Path,$Name,$Value,$Type,$ID,$RunFolder)
 }
 
 # -------------------------------------------------------------------------
-# 2. Load / Init Manifest
+# 2. Load / Create manifest.xml
 # -------------------------------------------------------------------------
 if (Test-Path $ManifestPath) {
-    $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+    [xml]$ManifestXml = Get-Content $ManifestPath -Raw
+    $ManifestNode = $ManifestXml.DocumentElement
 } else {
-    $Manifest = @()
+    $xml = @"
+<RegistryManifest>
+  <!-- All runs are appended here -->
+</RegistryManifest>
+"@
+    [xml]$ManifestXml = $xml
+    $ManifestNode = $ManifestXml.DocumentElement
 }
 
 # -------------------------------------------------------------------------
 # 3. ROLLBACK MODE
 # -------------------------------------------------------------------------
 if ($Rollback) {
-    if (-not $Manifest) { throw "No manifest – nothing to roll back." }
+    if (-not $ManifestNode.HasChildNodes) { throw "No runs in manifest.xml" }
 
-    # Choose run: last one, or specific RunId
-    $run = if ($RunId) { $Manifest | Where-Object RunId -eq $RunId } else { $Manifest[-1] }
-    if (-not $run) { throw "RunId $RunId not found." }
+    $runNode = if ($RunId) {
+        $ManifestNode.Run | Where-Object { $_.RunId -eq $RunId }
+    } else {
+        $ManifestNode.Run | Select-Object -Last 1
+    }
 
-    Write-Host "Rolling back RunId $($run.RunId) ($($run.Timestamp)) ..." -ForegroundColor Yellow
-    foreach ($e in $run.Entries) {
-        if (Test-Path $e.RegFile) {
-            Write-Host "  [ID:$($e.ID)] Importing $($e.RegFile)" -ForegroundColor Cyan
-            $out = reg import $e.RegFile 2>&1
+    if (-not $runNode) { throw "RunId $RunId not found in manifest.xml" }
+
+    Write-Host "Rolling back RunId $($runNode.RunId) ($($runNode.Timestamp)) ..." -ForegroundColor Yellow
+    foreach ($e in $runNode.Entry) {
+        $regFile = $e.RegFile
+        if (Test-Path $regFile) {
+            Write-Host "  [ID:$($e.ID)] Importing $regFile" -ForegroundColor Cyan
+            $out = reg import $regFile 2>&1
             if ($LASTEXITCODE -eq 0) { Write-Host "  Success" -ForegroundColor Green }
             else { Write-Warning "  FAILED: $out" }
+        } else {
+            Write-Warning "  [ID:$($e.ID)] Backup file missing: $regFile"
         }
     }
     Write-Host "Rollback complete." -ForegroundColor Green
@@ -100,10 +123,10 @@ if ($Rollback) {
 }
 
 # -------------------------------------------------------------------------
-# 4. Load XML & Select IDs
+# 4. Load Settings XML & Filter IDs
 # -------------------------------------------------------------------------
-[xml]$xml = Get-Content $XmlPath
-$all = $xml.RegistrySettings.Entry
+[xml]$SettingsXml = Get-Content $XmlPath
+$all = $SettingsXml.RegistrySettings.Entry
 $sel = if ($IDs -eq "all") { $all } else { $all | Where-Object { $_.ID -in ($IDs -split ',' | % Trim) } }
 if (-not $sel) { throw "No entries match IDs: $IDs" }
 
@@ -120,65 +143,66 @@ if ($VerifyOnly) {
         if (-not $match) { $ok=$false; Write-Host "  [ID:$($e.ID)] MISMATCH" -ForegroundColor Red }
         else { Write-Host "  [ID:$($e.ID)] OK" -ForegroundColor Green }
     }
+    if ($ok) { Write-Host "All verified." -ForegroundColor Green } else { Write-Host "Verification failed." -ForegroundColor Red }
     return
 }
 
 # -------------------------------------------------------------------------
-# 6. APPLY MODE – create run folder + backup + apply
+# 6. APPLY MODE – create run + backup + apply + append to manifest.xml
 # -------------------------------------------------------------------------
-$runId      = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$runFolder  = Join-Path $BackupRoot $runId
+$runId     = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$runFolder = Join-Path $BackupRoot $runId
 New-Item -ItemType Directory -Path $runFolder -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $runFolder "reg_files") -Force | Out-Null
 
-$runLog = @()
+$runNode = $ManifestXml.CreateElement("Run")
+$runNode.SetAttribute("RunId", $runId)
+$runNode.SetAttribute("Timestamp", (Get-Date).ToString("o"))
+$runNode.SetAttribute("XmlFile", $XmlPath)
+$runNode.SetAttribute("IDs", $IDs)
 
 foreach ($e in $sel) {
     $path = $e.Path; $name = $e.Name; $type = $TypeMap[$e.Type]; $id = $e.ID
     $value = $e.Value
 
-    # ----- value conversion -----
+    # Convert value
     switch ($type) {
         "DWORD"       { $value = [uint32][int]$value }
         "QWORD"       { $value = [uint64][long]$value }
         "MultiString" { $value = $value -split "`n" }
     }
 
-    # ----- ensure key exists -----
+    # Ensure key
     if (-not (Test-Path $path)) { New-Item $path -Force | Out-Null }
 
-    # ----- backup current state -----
+    # Backup
     $cur = Get-RegValue $path $name
     $regFile = New-RegBackup $path $name $cur.Value $cur.Type $id $runFolder
 
-    # ----- apply new value -----
+    # Apply
     try {
         if ($name -eq "(Default)") { Set-Item $path -Value $value -Force }
         else { Set-ItemProperty $path -Name $name -Value $value -Type $type -Force }
         Write-Host "  [ID:$id] Applied" -ForegroundColor Green
     } catch { Write-Error "  [ID:$id] FAILED: $_" }
 
-    # ----- log entry for this run -----
-    $runLog += [pscustomobject]@{
-        ID      = $id
-        Path     = $path
-        Name    = $name
-        OldVal  = $cur.Value
-        OldType = $cur.Type
-        RegFile = $regFile
-    }
+    # Add entry to run
+    $entryNode = $ManifestXml.CreateElement("Entry")
+    $entryNode.SetAttribute("ID", $id)
+    $entryNode.SetAttribute("Path", $path)
+    $entryNode.SetAttribute("Name", $name)
+    $entryNode.SetAttribute("OldValue", ($cur.Value -is [array] ? ($cur.Value -join ',') : $cur.Value))
+    $entryNode.SetAttribute("OldType", $cur.Type)
+    $entryNode.SetAttribute("RegFile", $regFile)
+    $runNode.AppendChild($entryNode) | Out-Null
 }
 
-# ----- Append run to global manifest -----
-$Manifest += [pscustomobject]@{
-    RunId     = $runId
-    Timestamp = (Get-Date).ToString("o")
-    XmlFile   = $XmlPath
-    IDs       = $IDs
-    Entries   = $runLog
-}
-$Manifest | ConvertTo-Json -Depth 10 | Set-Content $ManifestPath -Encoding UTF8
+# Append run to manifest
+$ManifestNode.AppendChild($runNode) | Out-Null
 
-Write-Host "`nRun $runId saved. Manifest updated." -ForegroundColor Magenta
-Write-Host "Rollback last run:  $($MyInvocation.MyCommand.Path) -XmlPath `"$XmlPath`" -Rollback" -ForegroundColor Yellow
-Write-Host "Rollback specific:  -Rollback -RunId $runId" -ForegroundColor Yellow
+# Save updated manifest.xml
+$ManifestXml.Save($ManifestPath)
+
+Write-Host "`nRun $runId saved to manifest.xml" -ForegroundColor Magenta
+Write-Host "Rollback last:   $($MyInvocation.MyCommand.Path) -XmlPath `"$XmlPath`" -Rollback" -ForegroundColor Yellow
+Write-Host "Rollback run:    -Rollback -RunId $runId" -ForegroundColor Yellow
